@@ -3,9 +3,14 @@
 //! diffs the results, so any behavioural divergence fails the suite. Run via
 //! `make test-cases`; see CLAUDE.md for the test-case file conventions.
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    convert::Infallible,
     env,
     error::Error,
     ffi::CString,
@@ -32,6 +37,7 @@ use monty_types::{
     CallArgs, CompileOptions, ExcType, ExtFunctionResult, FileMode, MontyException, MontyFileHandle, MontyObject,
     MontyUuid, NameLookupResult, OsFunctionCall, OsPolicy, PrintWriter, ResourceLimits, ResourceTracker,
     SandboxTimeZone, dir_stat, file_stat,
+    scan::{EntryInfo, Listing, ScanSource, collect_scan},
 };
 use pyo3::{prelude::*, types::PyDict};
 use similar::TextDiff;
@@ -62,9 +68,9 @@ const TEST_RECURSION_LIMIT: usize = 50;
 /// `sys.setrecursionlimit(N)` at the top — that hook is available on both
 /// Monty (under `test-hooks`) and CPython, so it works symmetrically.
 ///
-/// The underlying default GC interval is `DEFAULT_GC_INTERVAL` in
-/// `crates/monty/src/heap.rs`, which is 1 under `memory-model-checks` and
-/// 100_000 otherwise — tests that need a larger value to stay within the
+/// The underlying default GC interval is `GC_INTERVAL` in
+/// `crates/monty/src/heap/mod.rs`, which is 1 under `memory-model-checks` and
+/// `monty_types::DEFAULT_GC_INTERVAL` (100_000) otherwise — tests that need a larger value to stay within the
 /// timeout opt into it via `# gc-interval=<N>`.
 fn default_test_limits() -> ResourceLimits {
     ResourceLimits::default().max_recursion_depth(TEST_RECURSION_LIMIT)
@@ -397,6 +403,7 @@ fn parse_ref_counts(s: &str) -> AHashMap<String, usize> {
 ///     nested.txt       -> "nested content"
 ///     deep/
 ///       file.txt       -> "deep file"
+///       dangling       -> symlink to the missing "missing" (where the host allows symlinks)
 ///   readonly.txt       -> "readonly content"
 /// ```
 fn create_mount_fs_tempdir() -> tempfile::TempDir {
@@ -410,8 +417,20 @@ fn create_mount_fs_tempdir() -> tempfile::TempDir {
     fs::write(p.join("subdir/nested.txt"), "nested content").unwrap();
     fs::write(p.join("subdir/deep/file.txt"), "deep file").unwrap();
     fs::write(p.join("readonly.txt"), "readonly content").unwrap();
+    dangling_symlink("missing", &p.join("subdir/deep/dangling"));
 
     dir
+}
+
+/// Creates a file symlink to a target that does not exist, so cases can tell
+/// `lexists` from `exists`. Windows refuses symlinks without Developer Mode
+/// or elevation, so a failure leaves the link absent and the cases skip it by
+/// checking `os.path.islink` first.
+fn dangling_symlink(target: &str, link: &Path) {
+    #[cfg(unix)]
+    let _ = symlink(target, link);
+    #[cfg(windows)]
+    let _ = symlink_file(target, link);
 }
 
 /// Pre-imports Python modules that can cause race conditions during parallel test execution.
@@ -632,6 +651,40 @@ impl FixtureRegistry {
         value
     }
 
+    /// The host module `import tools` binds: its attrs are the fixture
+    /// functions, so `tools.add_ints(1, 2)` dispatches like a bare `add_ints(1, 2)`.
+    fn make_tools_module() -> MontyObject {
+        // `tools.nested`: a submodule, reached as an attribute of its parent
+        let nested = MontyObject::module(
+            "tools.nested",
+            MontyUuid::from_u128(6),
+            [
+                (
+                    MontyObject::string("return_value"),
+                    MontyObject::function("return_value", None),
+                ),
+                (MontyObject::string("VERSION"), MontyObject::int(7)),
+            ],
+        );
+        let functions = [
+            "add_ints",
+            "concat_strings",
+            "return_value",
+            "get_list",
+            "raise_error",
+            "async_call",
+            "async_fail",
+        ];
+        MontyObject::module(
+            "tools",
+            MontyUuid::from_u128(5),
+            functions
+                .iter()
+                .map(|name| (MontyObject::string(*name), MontyObject::function(*name, None)))
+                .chain([(MontyObject::string("nested"), nested)]),
+        )
+    }
+
     /// Registers and returns a `Point(x, y)` (type_id 1).
     fn make_point(&mut self, x: i64, y: i64) -> MontyObject {
         self.register(Fixture {
@@ -680,6 +733,11 @@ fn dispatch_method_call(
     let class_name = fixture.class_name;
 
     match (class_name, method_name) {
+        // The host decides callability; none of these fixtures is callable.
+        (_, "__call__") => {
+            let message = format!("'{class_name}' object is not callable");
+            MontyException::new(ExcType::TypeError, Some(message)).into()
+        }
         // Point.sum(self) -> int
         ("Point" | "MutablePoint", "sum") => MontyObject::int(fixture.int_attr("x") + fixture.int_attr("y")).into(),
         // Point.add(self, dx, dy) -> Point
@@ -898,6 +956,72 @@ fn is_virtual_dir(path: &str) -> bool {
     matches!(path, "/virtual" | "/virtual/subdir" | "/virtual/subdir/deep")
 }
 
+/// Reads the virtual filesystem below a scan root for `Path.scan`.
+struct VirtualScanSource<'a>(&'a str);
+
+impl VirtualScanSource<'_> {
+    /// Absolute virtual path of a path relative to the scan root.
+    fn absolute(&self, relative: &str) -> String {
+        if relative.is_empty() {
+            // The virtual filesystem names directories without a trailing slash.
+            let root = self.0.trim_end_matches('/');
+            if root.is_empty() {
+                "/".to_owned()
+            } else {
+                root.to_owned()
+            }
+        } else {
+            format!("{}/{relative}", self.0.trim_end_matches('/'))
+        }
+    }
+}
+
+impl ScanSource for VirtualScanSource<'_> {
+    type Error = Infallible;
+
+    fn list(&mut self, dir: &str) -> Result<Option<Listing>, Infallible> {
+        let listing = get_virtual_dir_entries(&self.absolute(dir)).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| {
+                    let name = entry
+                        .rsplit_once('/')
+                        .map_or(entry.as_str(), |(_, name)| name)
+                        .to_owned();
+                    (name, virtual_entry_info(&entry))
+                })
+                .collect::<Listing>()
+        });
+        Ok(listing)
+    }
+
+    fn lookup(&mut self, path: &str) -> Result<Option<EntryInfo>, Infallible> {
+        let path = self.absolute(path);
+        let exists = get_virtual_file(&path).is_some() || is_virtual_dir(&path);
+        Ok(exists.then(|| virtual_entry_info(&path)))
+    }
+
+    /// Unbounded: the harness runs only checked-in fixtures, whose writes the
+    /// test resets, so a scan never sees more than a test created.
+    fn visit(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    /// Free, as [`Self::visit`] is.
+    fn charge(&mut self, _bytes: usize) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+/// What the virtual filesystem holds at `path`; it has no symlinks.
+fn virtual_entry_info(path: &str) -> EntryInfo {
+    EntryInfo {
+        is_dir: is_virtual_dir(path),
+        is_file: get_virtual_file(path).is_some(),
+        is_symlink: false,
+    }
+}
+
 /// Get directory entries for a virtual directory.
 fn get_virtual_dir_entries(path: &str) -> Option<Vec<String>> {
     // First check if the directory exists
@@ -967,6 +1091,10 @@ fn get_virtual_dir_entries(path: &str) -> Option<Vec<String>> {
 #[expect(clippy::cast_possible_wrap)] // Virtual file sizes are tiny, no wrap possible
 fn dispatch_os_call(call: &OsFunctionCall) -> ExtFunctionResult {
     match call {
+        // Only the tools fixture is available as a host module.
+        OsFunctionCall::Import(module) if module == "tools" => FixtureRegistry::make_tools_module().into(),
+        OsFunctionCall::Import(_) => ExtFunctionResult::NotFound(call.name().to_owned()),
+        OsFunctionCall::ImportStubs(_) => unreachable!("{} is asked only by a type-checking worker", call.name()),
         // Fixed bytes for `os.urandom()`; fixtures assert invariants because CPython reads real entropy.
         OsFunctionCall::Urandom(args) => MontyObject::bytes(fixture_entropy(args.size)).into(),
         // `OsPolicy::default()` answers the clock and initial random seed in the sandbox.
@@ -1063,6 +1191,14 @@ fn dispatch_os_call(call: &OsFunctionCall) -> ExtFunctionResult {
                 .into()
             }
         }
+        OsFunctionCall::Scan(args) => match collect_scan(args, &mut VirtualScanSource(args.path.as_str())) {
+            Ok(Some(reply)) => reply.into_object().into(),
+            Ok(None) => MontyException::new(
+                ExcType::FileNotFoundError,
+                Some(format!("[Errno 2] No such file or directory: '{}'", args.path.as_str())),
+            )
+            .into(),
+        },
         OsFunctionCall::Resolve(p) | OsFunctionCall::Absolute(p) => MontyObject::string(p.as_str().to_owned()).into(),
         OsFunctionCall::Open(args) => {
             let path = args.path.as_str().to_owned();
@@ -1921,7 +2057,7 @@ fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, 
 /// the real dump format rather than only the underlying serde impls.
 #[cfg(not(feature = "memory-model-checks"))]
 fn dump_load_round_trip(progress: &RunProgress) -> RunProgress {
-    let bytes = dump("test.py", None, SessionRef::Running(progress)).expect("failed to dump RunProgress");
+    let bytes = dump("test.py", None, &[], SessionRef::Running(progress)).expect("failed to dump RunProgress");
     match Dump::load(&bytes).expect("failed to load RunProgress").state {
         Session::Running(progress) => *progress,
         _ => panic!("dumped a running session, loaded something else"),
@@ -1955,12 +2091,13 @@ fn idle_dump_round_trip(path: &Path, code: &str, config: &TestConfig) -> Result<
     // the case's own outcome was checked by the main run; a raising case still leaves its globals
     let _ = repl.feed_run(code, vec![], PrintWriter::Disabled);
 
-    let first = dump(&test_name, None, SessionRef::Idle(&repl)).map_err(|err| failure(format!("dump: {err}")))?;
+    let first = dump(&test_name, None, &[], SessionRef::Idle(&repl)).map_err(|err| failure(format!("dump: {err}")))?;
     let loaded = Dump::load(&first).map_err(|err| failure(format!("load: {err}")))?;
     let Session::Idle(loaded) = loaded.state else {
         return Err(failure("dumped an idle session, loaded something else".to_string()));
     };
-    let second = dump(&test_name, None, SessionRef::Idle(&loaded)).map_err(|err| failure(format!("re-dump: {err}")))?;
+    let second =
+        dump(&test_name, None, &[], SessionRef::Idle(&loaded)).map_err(|err| failure(format!("re-dump: {err}")))?;
     if first == second {
         Ok(())
     } else {
