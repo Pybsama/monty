@@ -9,29 +9,42 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   benchmarks:
-    name: Run benchmarks
-    runs-on: ubuntu-latest
+    name: Run benchmarks (${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: walltime
+            runner: codspeed-macro-arm64-graviton-ubuntu-22-04
+          - mode: memory
+            runner: ubuntu-24.04-arm
+    # CodSpeed's bare-metal Graviton macro runner, for walltime measurement. Pinned
+    # rather than `codspeed-macro` so the baseline stays on the same hardware,
+    # see https://codspeed.io/docs/features/macro-runners
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # no release versioning, see https://github.com/dtolnay/rust-toolchain/issues/180
-      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           lookup-only: false # zizmor: ignore[cache-poisoning] -- Job does not produce release artifacts and does not have sensitive permissions
           cache-on-failure: true
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
 
@@ -45,24 +58,28 @@ jobs:
       # the workers are optimized (a debug interpreter would make the pool
       # numbers meaningless), and point the bench at it via MONTY_TEST_BIN so it
       # resolves the binary instead of shelling out to `cargo build` mid-run.
-      # (CodSpeed instruments only the bench process, so the pool benches
-      # measure parent-side spawn/checkout/wire cost; the uninstrumented worker
-      # children are not counted.)
+      # (Walltime measurement counts the worker children too, so the pool
+      # benches measure end-to-end spawn/checkout/round-trip latency.)
       - name: Build the monty worker binary
         run: cargo build -p monty-runtime --release
 
-      # No `--bench` filter: build and run every monty-bench target (`main` +
-      # `pool`). CodSpeed runs all benches built into the package. The
+      # No `--bench` filter: build and run every monty-bench target. The
       # `codspeed` profile (root Cargo.toml) is release codegen — fat LTO,
       # one codegen unit — with symbols kept for CodSpeed's flamegraphs, so
       # measurements reflect the optimization level users actually run.
+      # The `codspeed` feature selects codspeed-criterion-compat and drops the
+      # CPython comparisons in both measurement modes.
       - name: Build benchmarks
-        run: cargo codspeed build -p monty-bench --profile codspeed
+        run: cargo codspeed build -m ${{ matrix.mode }} -p monty-bench --profile codspeed --features codspeed
 
+      # ASLR picks one of several memory layouts per process, which moves the
+      # allocation-heavy benchmarks 10-40% between runs of identical code. The
+      # `-R` personality is inherited by the pool's worker children too.
+      # Same fix as https://github.com/pydantic/jiter/pull/284
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@d872884a306dd4853acf0f584f4b706cf0cc72a2 # v4.13.0
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
         with:
-          mode: simulation
-          run: cargo codspeed run -p monty-bench
+          mode: ${{ matrix.mode }}
+          run: setarch $(uname -m) -R cargo codspeed run -p monty-bench
         env:
           MONTY_TEST_BIN: ${{ github.workspace }}/target/release/monty
